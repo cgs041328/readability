@@ -16,8 +16,8 @@ def getReadableArticle(url):
     res = requests.get(url)
     if res.status_code != requests.codes.ok:
         return None
-    rawHtml = res.content.decode("utf-8")
-    article = Readability(rawHtml,hostRe.match(url).group(0))
+    rawHtml = res.text
+    article = Readability(rawHtml,url)
     # if article is not None:
     #     with open(url.split('/')[-1].split('?')[0]+'.html', 'w+') as out:
     #         out.write(article.content)

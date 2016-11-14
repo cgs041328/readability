@@ -9,6 +9,7 @@ import math
 import posixpath
 import chardet
 from bs4 import BeautifulSoup
+import html5lib
 
 
 class Readability:
@@ -19,16 +20,18 @@ class Readability:
         'positive': re.compile("article|body|content|entry|hentry|h-entry|main|page|pagination|post|text|blog|story",re.I),
         'negative': re.compile("hidden|^hid$| hid$| hid |^hid |banner|combx|comment|com-|contact|foot|footer|footnote|masthead|media|meta|modal|outbrain|promo|related|scroll|share|shoutbox|sidebar|skyscraper|sponsor|shopping|tags|tool|widget", re.I),
         'extraneous': re.compile("print|archive|comment|discuss|e[\-]?mail|share|reply|all|login|sign|single|utility",re.I),
-        'divToPElements': re.compile("<(a|blockquote|dl|div|img|ol|p|pre|table|ul)",re.I),
+        'divToPElements': re.compile("<(a|blockquote|dl|div|img|ol|p|pre|table|ul|select)",re.I),
         'replaceBrs': re.compile("(<br[^>]*>[ \n\r\t]*){2,}",re.I),
         'replaceFonts': re.compile("<(/?)font[^>]*>",re.I),
         'killBreaks': re.compile("(<br\s*/?>(\s|&nbsp;?)*)+",re.I),
         'videos': re.compile("//(www\.)?(dailymotion|youtube|youtube-nocookie|player\.vimeo|youku|tudou|56|yinyuetai)\.com",re.I),
-        'link':re.compile("<a[^>]*>(.*?)</a>",re.I),
+        'link':re.compile("<a [^>]*>([\s\S]*?)</a>",re.I),
         'title':re.compile(r"(?<=<title>).*?(?=</title>)",re.I),
     }
 
     tagNamesToScore =  ["section","h2","h3","h4","h5","h6","p","td","pre"]
+
+    alterToDivExceptions =  ["div", "article", "section", "p"]
 
     def __init__(self, input_html, url):
         self.candidates = {}
@@ -36,14 +39,13 @@ class Readability:
         self.input_html = input_html
         self.url = url
         self.prepareDocument()
-        self.title = self.getArticleTitle()
         self.content = self.grabArticle()
+        self.title = self.getArticleTitle()
 
     def prepareDocument(self):
         self.input_html = self.regexps['replaceBrs'].sub("</p><p>", self.input_html)
         self.input_html = self.regexps['replaceFonts'].sub("<\g<1>span>", self.input_html)
-        self.html = BeautifulSoup(self.input_html, 'html.parser')
-        self.removeUnnecessaryElements()
+
 
     def removeUnnecessaryElements(self):
         for elem in self.html.find_all("script"):
@@ -56,84 +58,122 @@ class Readability:
             elem.extract()
 
     def grabArticle(self):
+        stripUnlikelyCandidates = True
         #score elements
-        elementsToScore = []
-        for elem in self.html.find_all(True):
-            unlikelyMatchString = elem.get('id','')+''.join(elem.get('class',''))
-            if self.regexps['unlikelyCandidates'].search(unlikelyMatchString) and \
-                not self.regexps['okMaybeItsACandidate'].search(unlikelyMatchString) and \
-                elem.name != 'body':
-                elem.extract()
-                continue
-            if elem.name in self.tagNamesToScore:
-                elementsToScore.append(elem)
-            if elem.name == 'div':
-                s = elem.encode_contents()
-                if not self.regexps['divToPElements'].search(s.decode()):
-                    elem.name = 'p'
-                    elementsToScore.append(elem)
-        for node in elementsToScore:
-            parentNode = node.parent
-            if not parentNode:
-                continue
-            innerText = node.text
-            if len(innerText) < 25:
-                continue
-            grandParentNode = parentNode.parent
-            parentHash = hash(str(parentNode))
-            if parentHash not in self.candidates:
-                self.candidates[parentHash] = self.initializeNode(parentNode)
-            grandParentHash = hash(str(grandParentNode))
-            if grandParentNode and grandParentHash not in self.candidates:
-                self.candidates[grandParentHash] = self.initializeNode(grandParentNode)
-            contentScore = 1
-            contentScore += len(innerText.replace('，', ',').split(','))
-            contentScore +=  min(math.floor(len(innerText) / 100), 3)
-            self.candidates[parentHash]['score'] += contentScore
-            if grandParentNode:
-                self.candidates[grandParentHash]['score'] += contentScore / 2
-        #end
-        #find top candidate
-        topCandidate = None
-        for key in self.candidates:
-            self.candidates[key]['score'] = self.candidates[key]['score'] * \
-                                            (1 - self.getLinkDensity(self.candidates[key]['node']))
+        while(True):
+            self.html = BeautifulSoup(self.input_html, 'html5lib')
+            self.removeUnnecessaryElements()
+            body = None
+            maxBodyLength = 0
+            for elem in self.html.find_all('body'):
+                elemLength = len(str(elem))
+                if maxBodyLength < elemLength:
+                    body = elem
+                    maxBodyLength = elemLength            
+            for elem in body.find_all(True):
+                if stripUnlikelyCandidates:
+                    unlikelyMatchString = elem.get('id','')+' '.join(elem.get('class',''))
+                    if self.regexps['unlikelyCandidates'].search(unlikelyMatchString) and \
+                        not self.regexps['okMaybeItsACandidate'].search(unlikelyMatchString) and \
+                        elem.name != 'body' and elem.name != 'a':
+                        elem.extract()
+                        continue
+                # if elem.name in self.tagNamesToScore:
+                #     elementsToScore.append(elem)
+                if elem.name == 'div':
+                    s = elem.encode_contents()
+                    if not self.regexps['divToPElements'].search(s.decode()):
+                        elem.name = 'p'
+                        # elementsToScore.append(elem)
+            self.candidates = {}
+            for node in self.html.find_all(self.tagNamesToScore):
+                parentNode = node.parent
+                if not parentNode:
+                    continue
+                innerText = node.text
+                if len(innerText) < 25:
+                    continue
+                ancestors = self.getAncestors(node,3)
+                contentScore = 1
+                contentScore += len(innerText.replace('，', ',').split(','))
+                contentScore +=  min(math.floor(len(innerText) / 100), 3)
+                level = 1
+                for ancestor in ancestors:
+                    ancestorHash = hash(str(ancestor))
+                    if not ancestorHash in self.candidates:
+                        self.candidates[ancestorHash] = self.initializeNode(ancestor)
+                    self.candidates[ancestorHash]['score'] += contentScore / level
+                    level = level + 1
+            #end
+            #find top candidate
+            topCandidate = None
+            for key in self.candidates:
+                # if self.candidates[key]['node'].name == '[document]':
+                #     continue
+                self.candidates[key]['score'] = self.candidates[key]['score'] * \
+                                                (1 - self.getLinkDensity(self.candidates[key]['node']))
 
-            if not topCandidate or self.candidates[key]['score'] > topCandidate['score']:
-                topCandidate = self.candidates[key]
-        #end
-        # articleContent = self.html.new_tag("div",id='eudic-reader-content')
-        articleContent = ''
-        if topCandidate:
-            #     #look through its siblings for content that might also be related, a little slow
-            # siblingScoreThreshold = max(10,topCandidate['score']*0.2)
-            # if topCandidate['node'].parent:
-            #     siblingNodes = topCandidate['node'].parent.children
-            #     for sibling in siblingNodes:
-            #         append = False
-            #         siblingHash = hash(str(sibling))
-            #         if sibling == topCandidate['node']:
-            #             append = True
-            #         elif siblingHash in self.candidates and self.candidates[siblingHash]['score'] >= siblingScoreThreshold:
-            #             append = True
-            #         elif sibling.name == 'p':
-            #             linkDensity = self.getLinkDensity(sibling)
-            #             nodeLength = len(sibling.text)
-            #             if nodeLength >80 and linkDensity< 0.25:
-            #                 append = True
-            #         if(append):
-            #             articleContent.append(sibling)
-            # else:
-            #     articleContent = topCandidate['node']
-            articleContent = topCandidate['node']
-            articleContent = self.prepareArticle(articleContent)
-        return articleContent
+                if not topCandidate or self.candidates[key]['score'] > topCandidate['score']:
+                    topCandidate = self.candidates[key]
+            #end
+            articleContent = self.html.new_tag("div",id='eudic-reader-content')
+            # articleContent = ''
+            if topCandidate:
+                #  Because of our bonus system, parents of candidates might have scores
+                #  themselves. They get half of the node. There won't be nodes with higher
+                #  scores than our topCandidate, but if we see the score going *up* in the first
+                #  few steps up the tree, that's a decent sign that there might be more content
+                #  lurking in other places that we want to unify in. The sibling stuff
+                #  below does some of that - but only if we've looked high enough up the DOM
+                #  tree.
+                parentNodeOfTopCandidate = topCandidate['node'].parent
+                lastScore = topCandidate['score']
+                scoreThreshold = lastScore / 3
+                parentHash = hash(str(parentNodeOfTopCandidate))
+                while parentNodeOfTopCandidate:
+                    parentHash = hash(str(parentNodeOfTopCandidate))
+                    if parentHash not in self.candidates:
+                        break
+                    parentCandidate = self.candidates[parentHash]
+                    parentScore = parentCandidate['score']
+                    if parentScore < scoreThreshold:
+                        break
+                    if parentScore > lastScore:
+                        topCandidate = parentCandidate
+                        break
+                    lastScore = parentScore
+                    parentNodeOfTopCandidate = parentNodeOfTopCandidate.parent
+                #look through its siblings for content that might also be related, a little slow
+                siblingScoreThreshold = max(10,topCandidate['score']*0.2)
+                siblingNodes = topCandidate['node'].parent.children
+                for sibling in siblingNodes:
+                    append = False
+                    siblingHash = hash(str(sibling))
+                    if sibling == topCandidate['node']:
+                        append = True
+                    elif siblingHash in self.candidates and self.candidates[siblingHash]['score'] >= siblingScoreThreshold:
+                        append = True
+                    elif sibling.name == 'p':
+                        linkDensity = self.getLinkDensity(sibling)
+                        nodeLength = len(sibling.text)
+                        if nodeLength >80 and linkDensity< 0.25:
+                            append = True
+                    if(append):
+                        articleContent.append(sibling)
+                # articleContent = topCandidate['node']
+                articleContent = self.prepareArticle(articleContent)
+            if len(articleContent.text.replace('\n','').strip())<500 and stripUnlikelyCandidates:
+                stripUnlikelyCandidates = False
+            else:
+                articleContent = self.killBreaks(articleContent)
+                #clean external links if needed
+                articleContent = self.cleanLink(articleContent)
+                return articleContent
 
     def cleanLink(self,content):
         return self.regexps['link'].sub(r'\1', content)
 
     def prepareArticle(self, content):
-        self.cleanStyle(content)
         self.clean(content, 'object')
         self.cleanConditionally(content, "form")
         self.clean(content, 'embed')
@@ -159,10 +199,8 @@ class Readability:
                 pElem.extract()
 
         self.fixImagesPath(content)
+        self.cleanStyle(content)
         self.description = content.text[:200]
-        content = self.killBreaks(content)
-        #clean external links if needed
-        #content = self.cleanLink(content)
         return content
 
     def clean(self,e ,tag):
@@ -219,7 +257,7 @@ class Readability:
                 contentLength = len(node.text)
                 toRemove = False
 
-                if img > p:
+                if img > p and not self.haveAncestor(node,'figure'):
                     toRemove = True
                 elif li > p and tag != "ul" and tag != "ol":
                     toRemove = True
@@ -290,7 +328,8 @@ class Readability:
             return 0
         linkLength = 0
         for link in links:
-            linkLength += len(link.text)
+            if len(link.find_all('img')) == 0:
+                linkLength += len(link.text)
 
         return linkLength / textLength
 
@@ -319,4 +358,27 @@ class Readability:
         content = content.encode_contents()
         content = self.regexps['killBreaks'].sub("<br />", content.decode())
         return content
+
+    def getAncestors(self,node,maxDepth):
+        i=0
+        ancestors = []
+        while node.parent:
+            ancestors.append(node.parent)
+            i = i+1
+            if i== maxDepth:
+                break
+            node = node.parent
+        return ancestors
+
+    def haveAncestor(self,node,tagName):
+        i = 0
+        maxDepth = 3
+        while node.parent:
+            if i== maxDepth:
+                return False
+            if node.parent.name == tagName:
+                return True
+            node = node.parent
+            i = i + 1
+        return False
 
